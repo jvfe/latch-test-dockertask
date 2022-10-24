@@ -1,6 +1,7 @@
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
 from dataclasses_json import dataclass_json
 from flytekit import task
@@ -40,22 +41,25 @@ class KaijuOut:
     dockerfile=Path(__file__).parent.parent / Path("kaiju_Dockerfile"),
 )
 def organize_kaiju_inputs(
-    samples: Sample,
+    samples: List[Sample],
     kaiju_ref_db: LatchFile,
     kaiju_ref_nodes: LatchFile,
     kaiju_ref_names: LatchFile,
     taxon_rank: TaxonRank,
-) -> KaijuSample:
+) -> List[KaijuSample]:
 
-    return KaijuSample(
-        read1=samples.read1,
-        read2=samples.read2,
-        sample_name=samples.sample_name,
-        kaiju_ref_db=kaiju_ref_db,
-        kaiju_ref_nodes=kaiju_ref_nodes,
-        kaiju_ref_names=kaiju_ref_names,
-        taxon_rank=taxon_rank,
-    )
+    return [
+        KaijuSample(
+            read1=sample.read1,
+            read2=sample.read2,
+            sample_name=sample.sample_name,
+            kaiju_ref_db=kaiju_ref_db,
+            kaiju_ref_nodes=kaiju_ref_nodes,
+            kaiju_ref_names=kaiju_ref_names,
+            taxon_rank=taxon_rank,
+        )
+        for sample in samples
+    ]
 
 
 @task(
@@ -106,12 +110,12 @@ def taxonomy_classification_task(kaiju_input: KaijuSample) -> KaijuOut:
 
 @workflow(test_DOCS)
 def kaiju_wf(
-    samples: Sample,
+    samples: List[Sample],
     kaiju_ref_db: LatchFile,
     kaiju_ref_nodes: LatchFile,
     kaiju_ref_names: LatchFile,
     taxon_rank: TaxonRank,
-) -> KaijuOut:
+) -> List[KaijuOut]:
 
     kaiju_inputs = organize_kaiju_inputs(
         samples=samples,
@@ -121,18 +125,25 @@ def kaiju_wf(
         taxon_rank=taxon_rank,
     )
 
-    return taxonomy_classification_task(kaiju_input=kaiju_inputs)
+    return map_task(taxonomy_classification_task)(kaiju_input=kaiju_inputs)
 
 
 LaunchPlan(
     kaiju_wf,  # workflow name
     "Example Metagenome (Crohn's disease gut microbiome)",  # name of test data
     {
-        "samples": Sample(
-            sample_name="SRR579291",
-            read1=LatchFile("s3://latch-public/test-data/4318/SRR579291_1.fastq"),
-            read2=LatchFile("s3://latch-public/test-data/4318/SRR579291_2.fastq"),
-        ),
+        "samples": [
+            Sample(
+                sample_name="SRR579291",
+                read1=LatchFile("s3://latch-public/test-data/4318/SRR579291_1.fastq"),
+                read2=LatchFile("s3://latch-public/test-data/4318/SRR579291_2.fastq"),
+            ),
+            Sample(
+                sample_name="SRR579292",
+                read1=LatchFile("s3://latch-public/test-data/4318/SRR579292_1.fastq"),
+                read2=LatchFile("s3://latch-public/test-data/4318/SRR579292_2.fastq"),
+            ),
+        ],
         "kaiju_ref_db": LatchFile(
             "s3://latch-public/test-data/4318/kaiju_db_viruses.fmi"
         ),
