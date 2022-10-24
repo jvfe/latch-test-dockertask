@@ -1,118 +1,147 @@
-"""
-Assemble and sort some COVID reads...
-"""
-
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
-from latch import small_task, workflow
+from dataclasses_json import dataclass_json
+from flytekit import task
+from latch import map_task, message, workflow
 from latch.resources.launch_plan import LaunchPlan
-from latch.types import LatchAuthor, LatchFile, LatchMetadata, LatchParameter
+from latch.resources.tasks import _get_large_pod, _get_small_pod
+from latch.types import LatchFile
+
+from .docs import test_DOCS
+from .types import Sample, TaxonRank
 
 
-@small_task
-def assembly_task(read1: LatchFile, read2: LatchFile) -> LatchFile:
-
-    # A reference to our output.
-    sam_file = Path("covid_assembly.sam").resolve()
-
-    _bowtie2_cmd = [
-        "bowtie2/bowtie2",
-        "--local",
-        "-x",
-        "wuhan",
-        "-1",
-        read1.local_path,
-        "-2",
-        read2.local_path,
-        "--very-sensitive-local",
-        "-S",
-        str(sam_file),
-    ]
-
-    subprocess.run(_bowtie2_cmd)
-
-    return LatchFile(str(sam_file), "latch:///covid_assembly.sam")
+@dataclass_json
+@dataclass
+class KaijuSample:
+    sample_name: str
+    read1: LatchFile
+    read2: LatchFile
+    kaiju_ref_db: LatchFile
+    kaiju_ref_nodes: LatchFile
+    kaiju_ref_names: LatchFile
+    taxon_rank: TaxonRank
 
 
-@small_task
-def sort_bam_task(sam: LatchFile) -> LatchFile:
-
-    bam_file = Path("covid_sorted.bam").resolve()
-
-    _samtools_sort_cmd = [
-        "samtools",
-        "sort",
-        "-o",
-        str(bam_file),
-        "-O",
-        "bam",
-        sam.local_path,
-    ]
-
-    subprocess.run(_samtools_sort_cmd)
-
-    return LatchFile(str(bam_file), "latch:///covid_sorted.bam")
+@dataclass_json
+@dataclass
+class KaijuOut:
+    sample_name: str
+    kaiju_out: LatchFile
+    kaiju_ref_nodes: LatchFile
+    kaiju_ref_names: LatchFile
+    taxon_rank: TaxonRank
 
 
-"""The metadata included here will be injected into your interface."""
-metadata = LatchMetadata(
-    display_name="Assemble and Sort FastQ Files",
-    documentation="your-docs.dev",
-    author=LatchAuthor(
-        name="John von Neumann",
-        email="hungarianpapi4@gmail.com",
-        github="github.com/fluid-dynamix",
-    ),
-    repository="https://github.com/your-repo",
-    license="MIT",
-    parameters={
-        "read1": LatchParameter(
-            display_name="Read 1",
-            description="Paired-end read 1 file to be assembled.",
-            batch_table_column=True,  # Show this parameter in batched mode.
-        ),
-        "read2": LatchParameter(
-            display_name="Read 2",
-            description="Paired-end read 2 file to be assembled.",
-            batch_table_column=True,  # Show this parameter in batched mode.
-        ),
-    },
-    tags=[],
+@task(
+    task_config=_get_small_pod(),
+    dockerfile=Path(__file__).parent.parent / Path("kaiju_Dockerfile"),
 )
+def organize_kaiju_inputs(
+    samples: Sample,
+    kaiju_ref_db: LatchFile,
+    kaiju_ref_nodes: LatchFile,
+    kaiju_ref_names: LatchFile,
+    taxon_rank: TaxonRank,
+) -> KaijuSample:
+
+    return KaijuSample(
+        read1=samples.read1,
+        read2=samples.read2,
+        sample_name=samples.sample_name,
+        kaiju_ref_db=kaiju_ref_db,
+        kaiju_ref_nodes=kaiju_ref_nodes,
+        kaiju_ref_names=kaiju_ref_names,
+        taxon_rank=taxon_rank,
+    )
 
 
-@workflow(metadata)
-def assemble_and_sort(read1: LatchFile, read2: LatchFile) -> LatchFile:
-    """Description...
+@task(
+    task_config=_get_large_pod(),
+    dockerfile=Path(__file__).parent.parent / Path("kaiju_Dockerfile"),
+)
+def taxonomy_classification_task(kaiju_input: KaijuSample) -> KaijuOut:
+    """Classify metagenomic reads with Kaiju"""
 
-    markdown header
-    ----
+    sample_name = kaiju_input.sample_name
+    output_name = f"{sample_name}_kaiju.out"
+    kaiju_out = Path(output_name).resolve()
 
-    Write some documentation about your workflow in
-    markdown here:
+    _kaiju_cmd = [
+        "kaiju",
+        "-t",
+        kaiju_input.kaiju_ref_nodes.local_path,
+        "-f",
+        kaiju_input.kaiju_ref_db.local_path,
+        "-i",
+        kaiju_input.read1.local_path,
+        "-j",
+        kaiju_input.read2.local_path,
+        "-z",
+        "96",
+        "-o",
+        str(kaiju_out),
+    ]
+    message(
+        "info",
+        {
+            "title": "Taxonomically classifying reads with Kaiju",
+            "body": f"Command: {' '.join(_kaiju_cmd)}",
+        },
+    )
+    subprocess.run(_kaiju_cmd)
 
-    > Regular markdown constructs work as expected.
+    return KaijuOut(
+        sample_name=kaiju_input.sample_name,
+        kaiju_out=LatchFile(
+            str(kaiju_out), f"latch:///kaiju/{sample_name}/{output_name}"
+        ),
+        kaiju_ref_nodes=kaiju_input.kaiju_ref_nodes,
+        kaiju_ref_names=kaiju_input.kaiju_ref_names,
+        taxon_rank=kaiju_input.taxon_rank,
+    )
 
-    # Heading
 
-    * content1
-    * content2
-    """
-    sam = assembly_task(read1=read1, read2=read2)
-    return sort_bam_task(sam=sam)
+@workflow(test_DOCS)
+def kaiju_wf(
+    samples: Sample,
+    kaiju_ref_db: LatchFile,
+    kaiju_ref_nodes: LatchFile,
+    kaiju_ref_names: LatchFile,
+    taxon_rank: TaxonRank,
+) -> KaijuOut:
+
+    kaiju_inputs = organize_kaiju_inputs(
+        samples=samples,
+        kaiju_ref_db=kaiju_ref_db,
+        kaiju_ref_nodes=kaiju_ref_nodes,
+        kaiju_ref_names=kaiju_ref_names,
+        taxon_rank=taxon_rank,
+    )
+
+    return taxonomy_classification_task(kaiju_input=kaiju_inputs)
 
 
-"""
-Add test data with a LaunchPlan. Provide default values in a dictionary with
-the parameter names as the keys. These default values will be available under
-the 'Test Data' dropdown at console.latch.bio.
-"""
 LaunchPlan(
-    assemble_and_sort,
-    "Test Data",
+    kaiju_wf,  # workflow name
+    "Example Metagenome (Crohn's disease gut microbiome)",  # name of test data
     {
-        "read1": LatchFile("s3://latch-public/init/r1.fastq"),
-        "read2": LatchFile("s3://latch-public/init/r2.fastq"),
+        "samples": Sample(
+            sample_name="SRR579291",
+            read1=LatchFile("s3://latch-public/test-data/4318/SRR579291_1.fastq"),
+            read2=LatchFile("s3://latch-public/test-data/4318/SRR579291_2.fastq"),
+        ),
+        "kaiju_ref_db": LatchFile(
+            "s3://latch-public/test-data/4318/kaiju_db_viruses.fmi"
+        ),
+        "kaiju_ref_nodes": LatchFile(
+            "s3://latch-public/test-data/4318/virus_nodes.dmp"
+        ),
+        "kaiju_ref_names": LatchFile(
+            "s3://latch-public/test-data/4318/virus_names.dmp"
+        ),
+        "taxon_rank": TaxonRank.species,
     },
 )
